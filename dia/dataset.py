@@ -12,30 +12,52 @@ from .config import DiaConfig
 
 
 class LocalDiaDataset(Dataset):
-    """Load from a local CSV (sep='|') + an audio folder."""
+    """Tải từ một tệp CSV cục bộ (phân tách bằng '|') và một thư mục âm thanh."""
     def __init__(self, csv_path: Path, audio_root: Path, config: DiaConfig, dac_model: dac.DAC):
-        self.df = pd.read_csv(csv_path, sep=r"\|", engine="python",
-                      names=["text","audio"], header=None)
         self.audio_root = audio_root
         self.config = config
         self.dac_model = dac_model
+        
+        try:
+            self.df = pd.read_csv(
+                csv_path,
+                sep='|',
+                header=None,
+                on_bad_lines='warn'
+            )
+            self.df.columns = ['audio', 'text', 'normalized_text']
+        except Exception as e:
+            print(f"LỖI NGHIÊM TRỌNG KHI ĐỌC TỆP CSV: {e}")
+            raise
 
     def __len__(self) -> int:
         return len(self.df)
 
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
-        lang = row.get("language", None)
-        text = f"[{lang}]" + row["text"] if lang else row["text"]
+        lang = "en"
+        text = f"[{lang}]" + row["text"]
+        
         audio_path = self.audio_root / f'{row["audio"]}.wav'
         waveform, sr = torchaudio.load(audio_path)
+        
         if sr != 44100:
             waveform = torchaudio.functional.resample(waveform, sr, 44100)
-        waveform = waveform.unsqueeze(0)
+        
+        # --- THAY ĐỔI QUAN TRỌNG Ở ĐÂY ---
+        # Đảm bảo waveform luôn có 3 chiều: (Batch, Channels, Time)
+        if waveform.ndim == 1:
+            # Nếu là mono 1D, thêm cả chiều batch và channel
+            waveform = waveform.unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, Time)
+        elif waveform.ndim == 2:
+            # Nếu là (Channels, Time), chỉ cần thêm chiều batch
+            waveform = waveform.unsqueeze(0)  # Shape: (1, Channels, Time)
+        
         with torch.no_grad():
-            audio_tensor = self.dac_model.preprocess(
-                waveform, 44100
-            ).to(next(self.dac_model.parameters()).device)
+            device = next(self.dac_model.parameters()).device
+            waveform = waveform.to(device)
+            
+            audio_tensor = self.dac_model.preprocess(waveform, 44100)
             _, encoded, *_ = self.dac_model.encode(audio_tensor, n_quantizers=None)
             encoded = encoded.squeeze(0).transpose(0, 1)
         return text, encoded, waveform

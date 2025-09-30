@@ -883,6 +883,56 @@ class DiaModel(
 
     def __init__(self, config: DiaConfig, compute_dtype: torch.dtype):
         super().__init__()
+        if config is None:
+            config = DiaConfig(**kwargs)
         self.config = config
         self.encoder = Encoder(config, compute_dtype)
         self.decoder = Decoder(config, compute_dtype)
+    
+    def forward(
+        self,
+        src_BxS: torch.Tensor,
+        tgt_BxTxC: torch.Tensor,
+        enc_self_attn_mask: torch.Tensor,
+        dec_self_attn_mask: torch.Tensor,
+        dec_cross_attn_mask: torch.Tensor,
+        **kwargs,
+    ):
+        """
+        Phương thức forward cho quá trình training.
+        Nó kết nối encoder và decoder lại với nhau.
+        """
+        # 1. Đưa dữ liệu qua Encoder
+        # Các lớp bên trong mong đợi một đối tượng "state" để chứa các mask và vị trí.
+        # Chúng ta tạo một phiên bản đơn giản của nó cho việc training.
+        
+        # Tạo đối tượng trạng thái tạm thời cho encoder
+        enc_state = EncoderInferenceState(
+            max_seq_len=src_BxS.size(1),
+            device=src_BxS.device,
+            positions=torch.arange(src_BxS.size(1), device=src_BxS.device)[None, :],
+            padding_mask=None, # Không cần vì đã có attn_mask
+            attn_mask=enc_self_attn_mask
+        )
+        encoder_output = self.encoder(src_BxS, enc_state)
+
+        # 2. Đưa dữ liệu qua Decoder
+        # Tương tự, tạo một đối tượng trạng thái tạm thời cho decoder
+        # KVCache cho cross-attention được tính từ encoder_output
+        cross_attn_cache = self.decoder.precompute_cross_attn_cache(encoder_output)
+
+        dec_state = DecoderInferenceState(
+            device=tgt_BxTxC.device,
+            dtype=encoder_output.dtype,
+            enc_out=encoder_output,
+            enc_positions=enc_state.positions,
+            dec_positions=torch.arange(tgt_BxTxC.size(1), device=tgt_BxTxC.device)[None, :],
+            self_attn_cache=[None] * self.config.decoder_config.num_hidden_layers, # Không dùng cache khi training
+            cross_attn_cache=cross_attn_cache,
+            casual_attn_mask=dec_self_attn_mask, # Gán mask từ batch
+            cross_attn_mask=dec_cross_attn_mask # Gán mask từ batch
+        )
+        
+        logits = self.decoder(tgt_BxTxC, dec_state)
+
+        return logits
