@@ -15,7 +15,7 @@ Key components:
 
 import os
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class EncoderConfig(BaseModel, frozen=True):
@@ -122,6 +122,32 @@ class DiaConfig(BaseModel, frozen=True):
         architectures: List of model architectures, defaults to ["DiaForConditionalGeneration"].
         delay_pattern: List of delay values for each audio channel, defaults to [0,8,9,10,11,12,13,14,15].
     """
+    @model_validator(mode='before')
+    @classmethod
+    def restructure_flat_config(cls, data: dict) -> dict:
+        """
+        Tự động tái cấu trúc config từ dạng phẳng sang dạng lồng nhau.
+        Nếu config đã ở dạng lồng nhau, sẽ không làm gì cả.
+        """
+        if not isinstance(data, dict):
+            return data # Để Pydantic xử lý các lỗi không phải dict
+
+        # Nếu config đã có cấu trúc đúng, trả về ngay lập tức
+        if 'encoder_config' in data and 'decoder_config' in data:
+            return data
+
+        encoder_keys = EncoderConfig.model_fields.keys()
+        decoder_keys = DecoderConfig.model_fields.keys()
+
+        encoder_params = {k: v for k, v in data.items() if k in encoder_keys}
+        decoder_params = {k: v for k, v in data.items() if k in decoder_keys}
+
+        # Tạo lại dữ liệu với cấu trúc lồng nhau
+        restructured_data = {k: v for k, v in data.items()}
+        restructured_data['encoder_config'] = encoder_params
+        restructured_data['decoder_config'] = decoder_params
+        
+        return restructured_data
 
     architectures: list[str] = Field(default_factory=lambda: ["DiaForConditionalGeneration"])
     bos_token_id: int = Field(default=1026)
