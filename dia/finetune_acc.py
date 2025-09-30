@@ -45,9 +45,9 @@ test_sentences = {
 
 # --- Cấu hình cho quá trình training ---
 class TrainConfig:
-    epochs: int = 500
+    epochs: int = 50
     batch_size: int = 1
-    grad_accum_steps: int = 2
+    grad_accum_steps: int = 8
     learning_rate: float = 1e-5
     warmup_steps: int = 500
     unconditional_frac: float = 0.15
@@ -101,7 +101,8 @@ def collate_fn(batch, config: DiaConfig):
     src = torch.stack(text_ids)
 
     # --- Xử lý Audio codes ---
-    max_audio = config.decoder_config.max_position_embeddings
+    # max_audio = config.decoder_config.max_position_embeddings
+    max_audio = 860
     seq_lens = [min(e.size(0), max_audio) for e in encodings]
     batch_max = max(seq_lens) if seq_lens else 0
 
@@ -285,7 +286,6 @@ def train(accelerator, model, dia_cfg, dac_model, dataset, train_cfg):
         writer = SummaryWriter(log_dir=str(train_cfg.runs_dir / train_cfg.run_name))
     else:
         writer = None
-
     train_loader, val_loader = setup_loaders(dataset, dia_cfg, train_cfg)
     
     opt = bnb.optim.AdamW8bit(model.parameters(), lr=train_cfg.learning_rate)
@@ -297,7 +297,6 @@ def train(accelerator, model, dia_cfg, dac_model, dataset, train_cfg):
     model, opt, train_loader, val_loader, sched = accelerator.prepare(
         model, opt, train_loader, val_loader, sched
     )
-
     global_step = 0
     for epoch in range(train_cfg.epochs):
         model.train()

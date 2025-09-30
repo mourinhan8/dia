@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from huggingface_hub import PyTorchModelHubMixin
 from torch import Tensor
 from torch.nn import RMSNorm
+from torch.utils.checkpoint import checkpoint
 
 from .config import DecoderConfig, DiaConfig, EncoderConfig
 from .state import DecoderInferenceState, EncoderInferenceState, KVCache
@@ -564,166 +565,60 @@ class EncoderLayer(nn.Module):
             compute_dtype=compute_dtype,
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        state: EncoderInferenceState,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, state: EncoderInferenceState) -> torch.Tensor:
         residual = x
         x_norm = self.pre_sa_norm(x).to(self.compute_dtype)
-
-        sa_out = self.self_attention(
-            X=x_norm,
-            q_positions=state.positions,
-            kv_positions=state.positions,
-            attn_mask=state.attn_mask,
-        )
+        sa_out = self.self_attention(X=x_norm, q_positions=state.positions, attn_mask=state.attn_mask)
         x = residual + sa_out
-
         residual = x
         x_norm = self.post_sa_norm(x).to(self.compute_dtype)
         mlp_out = self.mlp(x_norm)
         x = residual + mlp_out
-
         return x
 
 
 class Encoder(nn.Module):
-    """Transformer Encoder Stack using DenseGeneral."""
-
     def __init__(self, config: DiaConfig, compute_dtype: torch.dtype):
         super().__init__()
-        self.config = config
         enc_config = config.encoder_config
-        self.compute_dtype = compute_dtype
-
-        self.embedding = nn.Embedding(
-            enc_config.vocab_size,
-            enc_config.hidden_size,
-            dtype=compute_dtype,
-        )
+        self.embedding = nn.Embedding(enc_config.vocab_size, enc_config.hidden_size, dtype=compute_dtype)
         self.layers = nn.ModuleList([EncoderLayer(config, compute_dtype) for _ in range(enc_config.num_hidden_layers)])
-        self.norm = RMSNorm(
-            enc_config.hidden_size,
-            eps=enc_config.norm_eps,
-            dtype=torch.float32,
-        )
-
-    def forward(
-        self,
-        x_ids: torch.Tensor,
-        state: EncoderInferenceState,
-    ) -> torch.Tensor:
+        self.norm = RMSNorm(enc_config.hidden_size, eps=enc_config.norm_eps)
+    def forward(self, x_ids: torch.Tensor, state: EncoderInferenceState) -> torch.Tensor:
         x = self.embedding(x_ids)
-
         for layer in self.layers:
-            x = layer(x, state)
-
-        x = self.norm(x).to(self.compute_dtype)
-        return x
+            x = layer(x, state) # Truyền thẳng đối tượng state xuống
+        return self.norm(x)
 
 
 class DecoderLayer(nn.Module):
-    """Transformer Decoder Layer using DenseGeneral."""
-
     def __init__(self, config: DiaConfig, compute_dtype: torch.dtype):
         super().__init__()
-        self.config = config
-        dec_config = config.decoder_config
-        enc_config = config.encoder_config
-        dec_embed_dim = dec_config.hidden_size
-        enc_embed_dim = enc_config.hidden_size
+        dec_config, enc_config = config.decoder_config, config.encoder_config
         self.compute_dtype = compute_dtype
+        self.pre_sa_norm = RMSNorm(dec_config.hidden_size, eps=dec_config.norm_eps)
+        self.pre_ca_norm = RMSNorm(dec_config.hidden_size, eps=dec_config.norm_eps)
+        self.pre_mlp_norm = RMSNorm(dec_config.hidden_size, eps=dec_config.norm_eps)
+        self.self_attention = SelfAttention(dec_config, q_embed_dim=dec_config.hidden_size, kv_embed_dim=dec_config.hidden_size, num_query_heads=dec_config.num_attention_heads, num_kv_heads=dec_config.num_key_value_heads, head_dim=dec_config.head_dim, compute_dtype=compute_dtype)
+        self.cross_attention = CrossAttention(dec_config, q_embed_dim=dec_config.hidden_size, kv_embed_dim=enc_config.hidden_size, num_query_heads=dec_config.cross_num_attention_heads, num_kv_heads=dec_config.cross_num_key_value_heads, head_dim=dec_config.cross_head_dim, compute_dtype=compute_dtype)
+        self.mlp = MlpBlock(embed_dim=dec_config.hidden_size, intermediate_dim=dec_config.intermediate_size, compute_dtype=compute_dtype)
 
-        # Norms
-        self.pre_sa_norm = RMSNorm(
-            dec_embed_dim,
-            eps=dec_config.norm_eps,
-            dtype=torch.float32,
-        )
-        self.pre_ca_norm = RMSNorm(
-            dec_embed_dim,
-            eps=dec_config.norm_eps,
-            dtype=torch.float32,
-        )
-        self.pre_mlp_norm = RMSNorm(
-            dec_embed_dim,
-            eps=dec_config.norm_eps,
-            dtype=torch.float32,
-        )
-
-        # Self-Attention (GQA) with Causal Masking
-        self.self_attention = SelfAttention(
-            dec_config,
-            q_embed_dim=dec_embed_dim,
-            kv_embed_dim=dec_embed_dim,
-            num_query_heads=dec_config.num_attention_heads,
-            num_kv_heads=dec_config.num_key_value_heads,
-            head_dim=dec_config.head_dim,
-            compute_dtype=compute_dtype,
-            out_embed_dim=dec_embed_dim,
-        )
-        # Cross-Attention (MHA)
-        self.cross_attention = CrossAttention(
-            dec_config,
-            q_embed_dim=dec_embed_dim,
-            kv_embed_dim=enc_embed_dim,  # Note kv_embed_dim
-            num_query_heads=dec_config.cross_num_attention_heads,
-            num_kv_heads=dec_config.cross_num_key_value_heads,
-            head_dim=dec_config.cross_head_dim,
-            compute_dtype=compute_dtype,
-            out_embed_dim=dec_embed_dim,
-        )
-        # MLP
-        self.mlp = MlpBlock(
-            embed_dim=dec_embed_dim,
-            intermediate_dim=dec_config.intermediate_size,
-            compute_dtype=compute_dtype,
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        state: DecoderInferenceState,
-        self_attn_cache: KVCache | None = None,
-        cross_attn_cache: KVCache | None = None,
-        prefill: bool = False,
-        current_idx: int = 0,
-    ) -> torch.Tensor:
+    # SỬA LẠI HÀM FORWARD ĐỂ TRUY CẬP ĐỐI TƯỢNG ĐÚNG CÁCH
+    def forward(self, x: torch.Tensor, state: DecoderInferenceState, self_attn_cache: KVCache | None, cross_attn_cache: KVCache | None, prefill: bool) -> torch.Tensor:
         residual = x
         x_norm = self.pre_sa_norm(x).to(self.compute_dtype)
-
-        self_attn_mask = state.casual_attn_mask[None, None, current_idx]
-
-        sa_out = self.self_attention(
-            X=x_norm,  # (2, 1, D)
-            q_positions=state.dec_positions,  # (2, 1)
-            kv_positions=state.dec_positions,  # (2, 1)
-            attn_mask=self_attn_mask,
-            cache=self_attn_cache,
-            prefill=prefill,
-            is_causal=prefill,
-            current_idx=current_idx,
-        )
-
+        # SỬA LỖI: Dùng state.dec_positions và state.casual_attn_mask
+        sa_out = self.self_attention(X=x_norm, q_positions=state.dec_positions, attn_mask=state.casual_attn_mask, is_causal=True) # is_causal=True for decoder
         x = residual + sa_out
-
         residual = x
         x_norm = self.pre_ca_norm(x).to(self.compute_dtype)
-        ca_out = self.cross_attention(
-            Xq=x_norm,
-            q_positions=state.dec_positions,
-            kv_positions=state.enc_positions,
-            attn_mask=state.cross_attn_mask,
-            cache=cross_attn_cache,
-        )
+        # SỬA LỖI: Dùng state.dec_positions và state.cross_attn_mask
+        ca_out = self.cross_attention(Xq=x_norm, q_positions=state.dec_positions, attn_mask=state.cross_attn_mask, cache=cross_attn_cache)
         x = residual + ca_out
-
         residual = x
         x_norm = self.pre_mlp_norm(x).to(self.compute_dtype)
         mlp_out = self.mlp(x_norm)
         x = residual + mlp_out
-
         return x
 
 
@@ -872,23 +767,30 @@ class DiaModel(
     repo_url="https://github.com/nari-labs/dia",
     pipeline_tag="text-to-speech",
     license="apache-2.0",
-    coders={
-        DiaConfig: (
-            lambda x: x.model_dump(),
-            lambda data: DiaConfig.model_validate(data),
-        ),
-    },
 ):
     """PyTorch Dia Model using DenseGeneral."""
 
-    def __init__(self, config: DiaConfig, compute_dtype: torch.dtype):
+    def __init__(self, config: DiaConfig | dict = None, compute_dtype: torch.dtype = torch.float32, **kwargs):
         super().__init__()
-        if config is None:
+
+        # --- Logic khởi tạo linh hoạt và an toàn ---
+        # Trường hợp 1 (xảy ra khi gọi from_pretrained): 
+        # 'config' được truyền vào là một dictionary.
+        # Chúng ta cần chuyển nó thành một đối tượng DiaConfig.
+        if isinstance(config, dict):
+            # Dòng này sẽ gọi đến @model_validator để tái cấu trúc dict phẳng
+            config = DiaConfig(**config)
+        
+        # Trường hợp 2: 'config' không được truyền, nhưng các tham số nằm trong kwargs.
+        # (Dự phòng cho các cách gọi khác)
+        elif config is None:
             config = DiaConfig(**kwargs)
+
+        # Sau các bước trên, 'config' chắc chắn là một đối tượng DiaConfig hợp lệ.
         self.config = config
         self.encoder = Encoder(config, compute_dtype)
         self.decoder = Decoder(config, compute_dtype)
-    
+
     def forward(
         self,
         src_BxS: torch.Tensor,
@@ -898,41 +800,40 @@ class DiaModel(
         dec_cross_attn_mask: torch.Tensor,
         **kwargs,
     ):
-        """
-        Phương thức forward cho quá trình training.
-        Nó kết nối encoder và decoder lại với nhau.
-        """
-        # 1. Đưa dữ liệu qua Encoder
-        # Các lớp bên trong mong đợi một đối tượng "state" để chứa các mask và vị trí.
-        # Chúng ta tạo một phiên bản đơn giản của nó cho việc training.
-        
-        # Tạo đối tượng trạng thái tạm thời cho encoder
+        # 1. ENCODER PASS
         enc_state = EncoderInferenceState(
             max_seq_len=src_BxS.size(1),
             device=src_BxS.device,
-            positions=torch.arange(src_BxS.size(1), device=src_BxS.device)[None, :],
-            padding_mask=None, # Không cần vì đã có attn_mask
+            positions=torch.arange(src_BxS.size(1), device=src_BxS.device)[None, :].expand(src_BxS.size(0), -1),
+            padding_mask=None,
             attn_mask=enc_self_attn_mask
         )
         encoder_output = self.encoder(src_BxS, enc_state)
 
-        # 2. Đưa dữ liệu qua Decoder
-        # Tương tự, tạo một đối tượng trạng thái tạm thời cho decoder
-        # KVCache cho cross-attention được tính từ encoder_output
+        # 2. DECODER PASS
         cross_attn_cache = self.decoder.precompute_cross_attn_cache(encoder_output)
-
         dec_state = DecoderInferenceState(
             device=tgt_BxTxC.device,
             dtype=encoder_output.dtype,
             enc_out=encoder_output,
             enc_positions=enc_state.positions,
-            dec_positions=torch.arange(tgt_BxTxC.size(1), device=tgt_BxTxC.device)[None, :],
-            self_attn_cache=[None] * self.config.decoder_config.num_hidden_layers, # Không dùng cache khi training
+            dec_positions=torch.arange(tgt_BxTxC.size(1), device=tgt_BxTxC.device)[None, :].expand(tgt_BxTxC.size(0), -1),
+            self_attn_cache=[None] * self.config.decoder_config.num_hidden_layers,
             cross_attn_cache=cross_attn_cache,
-            casual_attn_mask=dec_self_attn_mask, # Gán mask từ batch
-            cross_attn_mask=dec_cross_attn_mask # Gán mask từ batch
+            casual_attn_mask=dec_self_attn_mask,
+            cross_attn_mask=dec_cross_attn_mask
         )
         
-        logits = self.decoder(tgt_BxTxC, dec_state)
+        decoder_hidden_states = sum(self.decoder.embeddings[i](tgt_BxTxC[..., i]) for i in range(self.decoder.num_channels))
+        for i, layer in enumerate(self.decoder.layers):
+            decoder_hidden_states = layer(
+                x=decoder_hidden_states,
+                state=dec_state,
+                self_attn_cache=None,
+                cross_attn_cache=dec_state.cross_attn_cache[i],
+                prefill=True
+            )
 
+        decoder_output = self.decoder.norm(decoder_hidden_states)
+        logits = self.decoder.logits_dense(decoder_output)
         return logits
