@@ -18,6 +18,7 @@ import bitsandbytes as bnb
 from tqdm import tqdm
 from datasets import load_dataset, interleave_datasets
 from accelerate import Accelerator
+from safetensors.torch import save_file
 
 import dac
 from .config import DiaConfig
@@ -325,8 +326,8 @@ def train(accelerator, model, dia_cfg, dac_model, dataset, train_cfg):
                 accelerator.wait_for_everyone()
                 if accelerator.is_main_process:
                     unwrapped_model = accelerator.unwrap_model(model)
-                    ckpt_path = train_cfg.output_dir / f"ckpt_step_{global_step}.pth"
-                    torch.save(unwrapped_model.state_dict(), ckpt_path)
+                    ckpt_path = train_cfg.output_dir / f"ckpt_step_{global_step}.safetensors"
+                    save_file(unwrapped_model.state_dict(), ckpt_path)
                     logger.info(f"Đã lưu checkpoint: {ckpt_path}")
             
             global_step += 1
@@ -361,6 +362,9 @@ def main():
         if not args.audio_root:
             raise ValueError("Phải cung cấp --audio_root khi sử dụng --csv_path")
         dataset = LocalDiaDataset(args.csv_path, args.audio_root, dia_cfg, dac_model)
+        num_samples_for_demo = 5000
+        logger.info(f"Đang giảm dataset xuống còn {num_samples_for_demo} mẫu để demo.")
+        dataset = dataset.select(range(num_samples_for_demo))
     elif args.dataset:
         ds1 = load_dataset(args.dataset, split="train", streaming=args.streaming)
         if args.streaming:
