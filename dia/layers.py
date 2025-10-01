@@ -604,21 +604,56 @@ class DecoderLayer(nn.Module):
         self.mlp = MlpBlock(embed_dim=dec_config.hidden_size, intermediate_dim=dec_config.intermediate_size, compute_dtype=compute_dtype)
 
     # SỬA LẠI HÀM FORWARD ĐỂ TRUY CẬP ĐỐI TƯỢNG ĐÚNG CÁCH
-    def forward(self, x: torch.Tensor, state: DecoderInferenceState, self_attn_cache: KVCache | None, cross_attn_cache: KVCache | None, prefill: bool) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        state: DecoderInferenceState,
+        self_attn_cache: KVCache | None = None,
+        cross_attn_cache: KVCache | None = None,
+        prefill: bool = False,
+        current_idx: int | None = None, # <-- SỬA LỖI: Thêm lại tham số current_idx
+    ) -> torch.Tensor:
+        # --- Self-Attention ---
         residual = x
         x_norm = self.pre_sa_norm(x).to(self.compute_dtype)
-        # SỬA LỖI: Dùng state.dec_positions và state.casual_attn_mask
-        sa_out = self.self_attention(X=x_norm, q_positions=state.dec_positions, attn_mask=state.casual_attn_mask, is_causal=True) # is_causal=True for decoder
+        
+        # Logic xử lý mask cho cả training và inference
+        if prefill:
+            # Khi training/prefill, dùng full causal mask
+            self_attn_mask = state.casual_attn_mask
+        else:
+            # Khi inference từng bước, chỉ lấy mask cho token hiện tại
+            self_attn_mask = state.casual_attn_mask[None, None, current_idx] if current_idx is not None else None
+            
+        sa_out = self.self_attention(
+            X=x_norm,
+            q_positions=state.dec_positions,
+            attn_mask=self_attn_mask,
+            cache=self_attn_cache,
+            prefill=prefill,
+            is_causal=prefill, # is_causal chỉ True khi training/prefill
+            current_idx=current_idx
+        )
         x = residual + sa_out
+
+        # --- Cross-Attention ---
         residual = x
         x_norm = self.pre_ca_norm(x).to(self.compute_dtype)
-        # SỬA LỖI: Dùng state.dec_positions và state.cross_attn_mask
-        ca_out = self.cross_attention(Xq=x_norm, q_positions=state.dec_positions, attn_mask=state.cross_attn_mask, cache=cross_attn_cache)
+        ca_out = self.cross_attention(
+            Xq=x_norm,
+            q_positions=state.dec_positions,
+            kv_positions=state.enc_positions,
+            attn_mask=state.cross_attn_mask,
+            cache=cross_attn_cache,
+        )
         x = residual + ca_out
+
+        # --- MLP ---
         residual = x
         x_norm = self.pre_mlp_norm(x).to(self.compute_dtype)
         mlp_out = self.mlp(x_norm)
         x = residual + mlp_out
+
         return x
 
 

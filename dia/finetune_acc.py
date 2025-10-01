@@ -10,7 +10,7 @@ import gc
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Subset
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.tensorboard import SummaryWriter
 from transformers import get_scheduler
@@ -46,7 +46,7 @@ test_sentences = {
 
 # --- Cấu hình cho quá trình training ---
 class TrainConfig:
-    epochs: int = 50
+    epochs: int = 2
     batch_size: int = 1
     grad_accum_steps: int = 8
     learning_rate: float = 1e-5
@@ -269,7 +269,11 @@ def eval_and_generate(accelerator, model, val_loader, dia_cfg, dac_model, writer
                 try:
                     audio_np = dia_gen.generate(text=text, verbose=False)
                     if audio_np is not None:
-                         writer.add_audio(f"Eval/{lang_code}", audio_np, global_step, 44100)
+                        mono_audio = audio_np.squeeze()
+                        if mono_audio.ndim > 1:
+                            mono_audio = mono_audio.mean(axis=0)
+                        
+                        writer.add_audio(f"Eval/{lang_code}", mono_audio, global_step, 44100)
                 except Exception as e:
                      logger.exception(f"Lỗi khi sinh audio mẫu cho ngôn ngữ {lang_code}: {e}")
 
@@ -326,9 +330,15 @@ def train(accelerator, model, dia_cfg, dac_model, dataset, train_cfg):
                 accelerator.wait_for_everyone()
                 if accelerator.is_main_process:
                     unwrapped_model = accelerator.unwrap_model(model)
-                    ckpt_path = train_cfg.output_dir / f"ckpt_step_{global_step}.safetensors"
-                    save_file(unwrapped_model.state_dict(), ckpt_path)
-                    logger.info(f"Đã lưu checkpoint: {ckpt_path}")
+                    save_directory = train_cfg.output_dir / f"ckpt_step_{global_step}"
+
+                    # 2. Dùng save_pretrained để lưu model có chia nhỏ (sharded)
+                    unwrapped_model.save_pretrained(
+                        save_directory,
+                        max_shard_size="4GB",
+                        safe_serialization=True
+                    )
+                    logger.info(f"Đã lưu checkpoint (sharded) tại: {save_directory}")
             
             global_step += 1
 
@@ -361,10 +371,11 @@ def main():
     if args.csv_path:
         if not args.audio_root:
             raise ValueError("Phải cung cấp --audio_root khi sử dụng --csv_path")
-        dataset = LocalDiaDataset(args.csv_path, args.audio_root, dia_cfg, dac_model)
-        num_samples_for_demo = 5000
+        full_dataset = LocalDiaDataset(args.csv_path, args.audio_root, dia_cfg, dac_model)
+        num_samples_for_demo = 2000
         logger.info(f"Đang giảm dataset xuống còn {num_samples_for_demo} mẫu để demo.")
-        dataset = dataset.select(range(num_samples_for_demo))
+        indices = range(min(num_samples_for_demo, len(full_dataset))) # Đảm bảo không vượt quá kích thước dataset
+        dataset = Subset(full_dataset, indices)
     elif args.dataset:
         ds1 = load_dataset(args.dataset, split="train", streaming=args.streaming)
         if args.streaming:
